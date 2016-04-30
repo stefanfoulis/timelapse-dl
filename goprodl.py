@@ -3,6 +3,7 @@ import requests
 import os
 import shutil
 import sys
+import time
 import datetime
 import uuid
 from bs4 import BeautifulSoup
@@ -69,7 +70,7 @@ def list_images():
             yield image_url
 
 
-def download_all_images(target_dir='', skip_existing=True, delete_after_download=False, check=None, use_subdirs=False):
+def download_all_images(target_dir='', skip_existing=True, delete_after_download=False, check=None, use_subdirs=False, sleep_between_images=3.0):
     log("==> DOWNLOADING images to {}".format(target_dir))
     target_dir = os.path.abspath(target_dir)
     for image_url, has_more in lookahead(list_images()):
@@ -93,6 +94,9 @@ def download_all_images(target_dir='', skip_existing=True, delete_after_download
         download(image_url, target_path=local_filepath, delete_after_download=real_delete_after_download, check=check)
         if delete_after_download and not real_delete_after_download:
             log('did not delete {} because it is the last one standing'.format(image_url))
+        # desparate attempt to not have the gopro crash
+        log('    sleeping for {}s, so gopro does not crash'.format(sleep_between_images))
+        time.sleep(sleep_between_images)
 
 
 
