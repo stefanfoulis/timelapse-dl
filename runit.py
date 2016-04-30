@@ -21,6 +21,7 @@ if __name__ == "__main__":
             goprodl.download_all_images(
                 target_dir=runit_cfg.TARGET_DIR,
                 delete_after_download=runit_cfg.DELETE_AFTER_DOWNLOAD,
+                sleep_between_images=runit_cfg.SLEEP_BETWEEN_IMAGES,
                 check=check,
             )
         except Exception as e:
