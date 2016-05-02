@@ -449,7 +449,7 @@ def cli_download(loop, mount_check_file, **kwargs):
 @click.option('--mount-check-file', default='/data/.itsmounted')
 @click.option('--hard-exit/--no-hard-exit', default=False)
 @click.option('--mount-check-fail-sleep-duration', default=30, help='in seconds')
-@click.option('--image-process-sleep-duration', default=60, help='in seconds'
+@click.option('--image-process-sleep-duration', default=60, help='in seconds')
 @click.option('--loop/--no-loop', default=False, help='loop forever')
 @click.option('--copy/--move', default=False, help='copy or move the file. default: move')
 def cli_process(loop, mount_check_file, **kwargs):
