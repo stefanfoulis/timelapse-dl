@@ -7,3 +7,4 @@ click
 colorama
 awscli
 honcho
+contexttimer

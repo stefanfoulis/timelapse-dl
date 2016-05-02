@@ -4,6 +4,9 @@ import functools
 import tempfile
 
 import click
+import collections
+
+import gc
 import requests
 import os
 import shutil
@@ -14,7 +17,10 @@ import exifread
 import json
 import hashlib
 import subprocess
+
+import sys
 from bs4 import BeautifulSoup
+from contexttimer import Timer
 
 
 def log(txt):
@@ -47,7 +53,9 @@ def extract_exif_date(image_path):
     return datetime_native
 
 
-def md5(fname):
+def md5(fname, dryrun=False):
+    if dryrun:
+        return 'DRYRUN-MD5'
     hash_md5 = hashlib.md5()
     with open(fname, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
@@ -216,56 +224,100 @@ def check_and_raise(check_func):
     return True
 
 
-def resize_image(
-        source_file,
-        source_filename,
-        target_dir,
-        resolution,
-        shot_at,
-        optimise=True,
-        check=None,
-):
-    with temporary_directory() as tmpdir:
-        tmpfile = os.path.join(tmpdir, source_filename)
-        cmd = 'convert {source_file} -resize {resolution} {output}'.format(
-            source_file=source_file,
-            resolution=resolution,
-            output=tmpfile,
-        )
-        p = subprocess.Popen(cmd, shell=True)
-        p.wait()
-        if p.returncode:
-            raise Exception('[!!!!!] "{}" failed! '.format(cmd))
-        if optimise:
-            cmd = 'jpegoptim --strip-all {}'.format(tmpfile)
+def resize_image(source_file, target_file, resolution, optimise, dryrun=False):
+    cmd = 'convert {source_file} -resize {resolution} {target_file}'.format(
+        source_file=source_file,
+        resolution=resolution,
+        target_file=target_file,
+    )
+    if dryrun:
+        click.echo(' dryrun --> [{}] {}'.format(resolution, cmd))
+    else:
+        with Timer() as t_resize:
             p = subprocess.Popen(cmd, shell=True)
             p.wait()
             if p.returncode:
                 raise Exception('[!!!!!] "{}" failed! '.format(cmd))
-        target_file = os.path.join(
-            target_dir,
-            resolution,
-            generate_relative_image_path(
-                source_file=tmpfile,
-                source_filename=source_filename,
-                shot_at=shot_at,
-                resolution=resolution,
+        click.echo(' -[{}]-> resized to {} {}'.format(t_resize.elapsed, resolution, os.path.basename(source_file)))
+    if optimise:
+        with Timer() as t_opt:
+            cmd = 'jpegoptim --strip-all {}'.format(target_file)
+            if dryrun:
+                click.echo(' dryrun --> [{}] {}'.format(resolution, cmd))
+            else:
+                p = subprocess.Popen(cmd, shell=True)
+                p.wait()
+                if p.returncode:
+                    raise Exception('[!!!!!] "{}" failed! '.format(cmd))
+        click.echo(' -[{}]-> optimised {} {}'.format(t_opt.elapsed, resolution, os.path.basename(source_file)))
+
+
+def resize_images(
+        source_file,
+        source_filename,
+        target_dir,
+        resolutions,
+        shot_at,
+        optimise=True,
+        check=None,
+        dryrun=False
+):
+    # this is optimised to use the already created smaller version of the image
+    # as a basis for the next smaller size.
+    with temporary_directory() as tmpdir:
+        resolutions = sorted(resolutions, reverse=True)
+        imgs = collections.OrderedDict({})
+        first = True
+        next_res_source_file = source_file
+        for resolution in resolutions:
+            if first:
+                first = False
+            res_source_file = next_res_source_file
+            res_target_file = os.path.join(tmpdir, '{}-{}'.format(resolution, source_filename))
+            next_res_source_file = res_target_file
+            imgs[resolution] = {
+                'source_file': res_source_file,
+                'tmp_target_file': res_target_file,
+                'resolution': resolution,
+            }
+        for img in imgs.values():
+            check_and_raise(check)
+            resize_image(
+                source_file=img['source_file'],
+                target_file=img['tmp_target_file'],
+                resolution=img['resolution'],
+                optimise=optimise,
+                dryrun=dryrun,
             )
-        )
-        check_and_raise(check)
-        mkdirs(os.path.dirname(target_file))
-        shutil.move(tmpfile, target_file)
+        for img in imgs.values():
+            target_file = os.path.join(
+                target_dir,
+                img['resolution'],
+                generate_relative_image_path(
+                    source_file=img['tmp_target_file'],
+                    source_filename=source_filename,
+                    shot_at=shot_at,
+                    resolution=img['resolution'],
+                    dryrun=dryrun,
+                )
+            )
+            if dryrun:
+                click.echo(' dryrun --> [{}] mv {} to {}'.format(img['resolution'], img['tmp_target_file'], target_file))
+            else:
+                check_and_raise(check)
+                mkdirs(os.path.dirname(target_file))
+                shutil.move(img['tmp_target_file'], target_file)
 
 
 def datetime_to_datetimestr(dt):
     return dt.strftime('%Y-%m-%d'), dt.strftime('%Y-%m-%d_%H-%M-%S')
 
 
-def generate_relative_image_path(source_file, source_filename, shot_at, resolution):
+def generate_relative_image_path(source_file, source_filename, shot_at, resolution, dryrun):
     source_filename, extension = os.path.splitext(source_filename)
     extension = extension[1:]
     folder_date_str, img_date_str = datetime_to_datetimestr(shot_at)
-    md5sum = md5(source_file)
+    md5sum = md5(source_file, dryrun=dryrun)
     new_filename = '.'.join([
         img_date_str,
         source_filename,
@@ -277,22 +329,32 @@ def generate_relative_image_path(source_file, source_filename, shot_at, resoluti
     return new_path
 
 
-def process_image(source_file, target_dir, copy, check, resize, **kwargs):
+def process_image(
+        source_file,
+        target_dir,
+        copy,
+        resize,
+        source_filename=None,
+        dryrun=False,
+        check=None,
+        **kwargs
+):
     click.echo(' ==> handling {}'.format(source_file))
     shot_at = extract_exif_date(image_path=source_file)
     click.echo(' --> shot at {}'.format(shot_at))
-    source_filename = os.path.basename(source_file)
+    source_filename = source_filename or os.path.basename(source_file)
     if resize:
-        for resolution in ['160x120', '320x240', '640x480']:
-            click.echo(' --> resizing {}'.format(resolution))
-            resize_image(
-                source_file=source_file,
-                target_dir=target_dir,
-                resolution=resolution,
-                shot_at=shot_at,
-                source_filename=source_filename,
-                check=check,
-            )
+        resolutions = ['640x480', '320x240', '160x120']
+        click.echo(' --> resizing to {}'.format(' '.join(resolutions)))
+        resize_images(
+            source_file=source_file,
+            target_dir=target_dir,
+            resolutions=resolutions,
+            shot_at=shot_at,
+            source_filename=source_filename,
+            check=check,
+            dryrun=dryrun,
+        )
     new_path = os.path.join(
         target_dir,
         'original',
@@ -301,14 +363,24 @@ def process_image(source_file, target_dir, copy, check, resize, **kwargs):
             source_filename=source_filename,
             shot_at=shot_at,
             resolution='original',
+            dryrun=dryrun,
         )
     )
-    check_and_raise(check)
-    mkdirs(os.path.dirname(new_path))
-    if copy:
-        shutil.copy(source_file, new_path)
+    if dryrun:
+        click.echo(
+            ' dryrun --> [{}] mv {} to {}'.format(
+                'cp' if copy else 'mv',
+                source_file,
+                new_path
+            )
+        )
     else:
-        shutil.move(source_file, new_path)
+        check_and_raise(check)
+        mkdirs(os.path.dirname(new_path))
+        if copy:
+            shutil.copy(source_file, new_path)
+        else:
+            shutil.move(source_file, new_path)
 
 
 def process_all_images(source_dir, **kwargs):
@@ -321,6 +393,31 @@ def process_all_images(source_dir, **kwargs):
         if not filename.lower().endswith('.jpg'):
             continue
         process_image(source_file=filepath, **kwargs)
+
+
+def reprocess_all_images(source_dir, target_dir, resize, copy, dryrun=False):
+    for day_subdir in os.listdir(source_dir):
+        day_dir = os.path.join(source_dir, day_subdir)
+        if not os.path.isdir(day_dir):
+            continue
+        for filename in os.listdir(day_dir):
+            source_file = os.path.join(day_dir, filename)
+            if not os.path.isfile(source_file):
+                continue
+            if filename.startswith('.'):
+                continue
+            if not filename.lower().endswith('.jpg'):
+                continue
+            # FIXME: hardcoded hack because I know the file structure
+            original_filename = filename[20:]
+            process_image(
+                source_file=source_file,
+                source_filename=original_filename,
+                target_dir=target_dir,
+                copy=copy,
+                resize=resize,
+                dryrun=dryrun,
+            )
 
 
 def download_loop(**kwargs):
@@ -373,23 +470,45 @@ def process_loop(**kwargs):
             exit(1)
 
 
-def upload(copy, source_dir, destination, **kwargs):
-    cmd = ' '.join([
-        'aws',
-        's3',
-        'cp' if copy else 'mv',
-        source_dir,
-        destination,
-        '--include', '"*.JPG"',
-        '--exclude', '".*"',
-        '--acl', 'public-read',
-        '--cache-control', 'max-age=604800',
-        '--recursive',
-    ])
-    p = subprocess.Popen(cmd, shell=True)
-    p.wait()
-    if p.returncode:
-        raise Exception('[!!!!!] "{}" failed! '.format(cmd))
+def upload(copy, sync, source_dir, destination, aws_profile, aws_region, dryrun=False, **kwargs):
+    if sync:
+        cmd = [
+            'aws',
+            's3',
+            'sync',
+            source_dir,
+            destination,
+            '--include', '"*.JPG"',
+            '--exclude', '".*"',
+            '--acl', 'public-read',
+            '--profile', aws_profile,
+            '--size-only',
+            '--cache-control', 'max-age=604800',
+        ]
+    else:
+        cmd = [
+            'aws',
+            's3',
+            'cp' if copy else 'mv',
+            source_dir,
+            destination,
+            '--include', '"*.JPG"',
+            '--exclude', '".*"',
+            '--acl', 'public-read',
+            '--cache-control', 'max-age=604800',
+            '--recursive',
+        ]
+
+    if aws_region:
+        cmd = cmd + ['--region', aws_region]
+    cmd = ' '.join(cmd)
+    if dryrun:
+        click.echo(' dryrun --> {}'.format(cmd))
+    else:
+        p = subprocess.Popen(cmd, shell=True)
+        p.wait()
+        if p.returncode:
+            raise Exception('[!!!!!] "{}" failed! '.format(cmd))
 
 
 def upload_loop(**kwargs):
@@ -425,14 +544,17 @@ def cli():
 @cli.command(name='download', help='download images from gopro')
 @click.option('--target-dir', default='/data/raw-photos')
 @click.option('--progress-dir', default='/data/download-progress')
-@click.option('--mount-check-file', default='/data/.itsmounted')
+@click.option('--mount-check-file', default=None)
 @click.option('--hard-exit/--no-hard-exit', default=False)
 @click.option('--mount-check-fail-sleep-duration', default=30, help='in seconds')
 @click.option('--delete-after-download/--no-delete-after-download', default=False, help='delete images from camera after successful download')
 @click.option('--image-download-sleep-duration', default=3, help='in seconds')
 @click.option('--loop/--no-loop', default=False, help='loop forever')
 def cli_download(loop, mount_check_file, **kwargs):
-    check = functools.partial(check_stick_connected, mount_check_file)
+    if mount_check_file is None:
+        check = lambda: True
+    else:
+        check = functools.partial(check_stick_connected, mount_check_file)
     kwargs['check'] = check
     if loop:
         click.echo('Starting download in loop mode')
@@ -446,14 +568,17 @@ def cli_download(loop, mount_check_file, **kwargs):
 @click.option('--source-file', default=None, help='handle just this one file. will ignore source-dir and loop')
 @click.option('--target-dir', default='/data/processed-photos')
 @click.option('--resize/--no-resize', default=True, help='resize the images')
-@click.option('--mount-check-file', default='/data/.itsmounted')
+@click.option('--mount-check-file', default=None)
 @click.option('--hard-exit/--no-hard-exit', default=False)
 @click.option('--mount-check-fail-sleep-duration', default=30, help='in seconds')
-@click.option('--image-process-sleep-duration', default=60, help='in seconds')
+@click.option('--image-process-sleep-duration', default=10, help='in seconds')
 @click.option('--loop/--no-loop', default=False, help='loop forever')
 @click.option('--copy/--move', default=False, help='copy or move the file. default: move')
 def cli_process(loop, mount_check_file, **kwargs):
-    check = functools.partial(check_stick_connected, mount_check_file)
+    if mount_check_file is None:
+        check = lambda: True
+    else:
+        check = functools.partial(check_stick_connected, mount_check_file)
     kwargs['check'] = check
     if kwargs['source_file']:
         # handle
@@ -468,17 +593,36 @@ def cli_process(loop, mount_check_file, **kwargs):
         process_all_images(**kwargs)
 
 
+@cli.command(name='reprocess', help='process downloaded images')
+@click.option('--source-dir')
+@click.option('--target-dir')
+@click.option('--resize/--no-resize', default=True, help='resize the images')
+@click.option('--copy/--move', default=False, help='copy or move the file. default: move')
+@click.option('--dryrun/--no-dryrun', default=False, help='do not actually do anything')
+def cli_reprocess(**kwargs):
+    reprocess_all_images(**kwargs)
+
+
+
+
 @cli.command(name='upload', help='upload images')
 @click.option('--source-dir', default='/data/processed-photos')
-@click.option('--destination', help='the s3 destination. e.g s3://my-bucket-name/')
-@click.option('--mount-check-file', default='/data/.itsmounted')
+@click.option('--destination', default='s3://weiherstrasse-timelapse/overview/', help='the s3 destination. e.g s3://my-bucket-name/')
+@click.option('--aws-profile', default='default', help='the aws profile to use')
+@click.option('--aws-region', default='', help='the aws region to use')
+@click.option('--mount-check-file', default=None)
 @click.option('--hard-exit/--no-hard-exit', default=False)
 @click.option('--mount-check-fail-sleep-duration', default=30, help='in seconds')
 @click.option('--upload-sleep-duration', default=60, help='in seconds')
 @click.option('--loop/--no-loop', default=False, help='loop forever')
-@click.option('--copy/--move', default=False, help='copy or move the file. default: move')
+@click.option('--copy/--move', default=True, help='copy or move the file. default: copy')
+@click.option('--sync/--no-sync', default=True, help='sync rather than blind copy. does not work with --move. default: --sync')
+@click.option('--dryrun/--no-dryrun', default=False, help='do not actually do anything')
 def cli_upload(loop, mount_check_file, **kwargs):
-    check = functools.partial(check_stick_connected, mount_check_file)
+    if mount_check_file is None:
+        check = lambda: True
+    else:
+        check = functools.partial(check_stick_connected, mount_check_file)
     kwargs['check'] = check
     if loop:
         click.echo('Starting upload in loop mode')
@@ -487,5 +631,18 @@ def cli_upload(loop, mount_check_file, **kwargs):
         upload(**kwargs)
 
 
+def disable_stdout_buffering():
+    # Appending to gc.garbage is a way to stop an object from being
+    # destroyed.  If the old sys.stdout is ever collected, it will
+    # close() stdout, which is not good.
+    gc.garbage.append(sys.stdout)
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', 0)
+
+
+# Then this will give output in the correct order:
+disable_stdout_buffering()
+
+
 if __name__ == '__main__':
+    print('PYTHONUNBUFFERED={}'.format(os.environ.get('PYTHONUNBUFFERED')))
     cli()
