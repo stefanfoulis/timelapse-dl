@@ -136,7 +136,7 @@ def download_all_images(
     for image_url, has_more in lookahead(list_images()):
         image_filename = image_url.split('/')[-1]
         progress_filename = '{}.json'.format(image_filename)
-        progress_filepath = os.path.join(progress_dir, progress_filename)
+        progress_filepath = os.path.join(progress_dir, image_filename[0:3], image_filename[3:6], progress_filename)
         if skip_existing and os.path.exists(progress_filepath):
             log('   skipping download of {}'.format(image_url))
             if delete_after_download:
@@ -154,7 +154,8 @@ def download_all_images(
             check=check,
         )
         if raw_image_path and os.path.exists(raw_image_path):
-            with open(progress_filepath, 'wb') as f:
+            mkdirs(os.path.dirname(progress_filepath))
+            with open(progress_filepath, 'w+') as f:
                 json.dumps({}, f)
         if delete_after_download and not real_delete_after_download:
             log('did not delete {} because it is the last one standing'.format(image_url))
@@ -198,12 +199,10 @@ def download(url, target_dir, delete_after_download=False, check=None):
 
 
 def delete_image(url):
-    # TODO: implement
     rel_path = url.split('/DCIM')[-1]
     log('deleting {}'.format(rel_path))
     requests.get(
         "http://10.5.5.9/gp/gpControl/command/storage/delete?p={}".format(rel_path),
-        #params={'p': rel_path}
     )
 
 
@@ -337,12 +336,29 @@ def process_image(
         source_filename=None,
         dryrun=False,
         check=None,
+        skip_existing=True,
         **kwargs
 ):
     click.echo(' ==> handling {}'.format(source_file))
     shot_at = extract_exif_date(image_path=source_file)
     click.echo(' --> shot at {}'.format(shot_at))
     source_filename = source_filename or os.path.basename(source_file)
+    new_path = os.path.join(
+        target_dir,
+        'original',
+        generate_relative_image_path(
+            source_file=source_file,
+            source_filename=source_filename,
+            shot_at=shot_at,
+            resolution='original',
+            dryrun=dryrun,
+        )
+    )
+    if skip_existing and os.path.exists(new_path):
+        click.echo(' !-> skipping {} because destination already exists'.format(
+            source_filename
+        ))
+        return
     if resize:
         resolutions = ['640x480', '320x240', '160x120']
         click.echo(' --> resizing to {}'.format(' '.join(resolutions)))
@@ -355,17 +371,6 @@ def process_image(
             check=check,
             dryrun=dryrun,
         )
-    new_path = os.path.join(
-        target_dir,
-        'original',
-        generate_relative_image_path(
-            source_file=source_file,
-            source_filename=source_filename,
-            shot_at=shot_at,
-            resolution='original',
-            dryrun=dryrun,
-        )
-    )
     if dryrun:
         click.echo(
             ' dryrun --> [{}] mv {} to {}'.format(
@@ -395,29 +400,106 @@ def process_all_images(source_dir, **kwargs):
         process_image(source_file=filepath, **kwargs)
 
 
-def reprocess_all_images(source_dir, target_dir, resize, copy, dryrun=False):
-    for day_subdir in os.listdir(source_dir):
-        day_dir = os.path.join(source_dir, day_subdir)
-        if not os.path.isdir(day_dir):
+def _is_image(directory, filename):
+    file_path = os.path.join(directory, filename)
+    return all([
+        os.path.isfile(file_path),
+        not filename.startswith('.'),
+        filename.lower().endswith('.jpg'),
+    ])
+
+
+def _extract_original_filename(filename):
+    # old format: 2016-05-03_00-02-59_A_G0070289.JPG
+    # new format: 2016-05-03_00-02-59.A_G0070289.original.6c227c09a043c0e30a86a61ddd445734.JPG
+    # remove the date and time
+    filename = filename[20:]
+    # remove '.' seperated stuff in the middle (size and checksum with new format)
+    split = filename.split('.')
+    filename = '{}.{}'.format(split[0], split[-1])
+    return filename
+
+
+def _reprocess_daydir_with_progress(**kwargs):
+    day_dir = os.path.join(kwargs['source_dir'], kwargs['day_subdir'])
+    if os.path.isdir(day_dir):
+        source_filenames = [
+            filename for filename in os.listdir(day_dir)
+            if _is_image(day_dir, filename)
+        ]
+    else:
+        source_filenames = []
+    kwargs['source_filenames'] = source_filenames
+    with click.progressbar(length=len(source_filenames), label='PROGRESS {} '.format(kwargs['day_subdir'])) as bar:
+        kwargs['bar'] = bar
+        reprocess_daydir(**kwargs)
+
+
+def reprocess_daydir(day_subdir, source_dir, target_dir, resize, copy, dryrun=False, source_filenames=None, bar=None):
+    day_dir = os.path.join(source_dir, day_subdir)
+    if not os.path.isdir(day_dir):
+        return
+    source_filenames = source_filenames or [
+        filename for filename in os.listdir(day_dir)
+        if _is_image(day_dir, filename)
+    ]
+    originals_target_dir = os.path.join(target_dir, 'original', day_subdir)
+    if os.path.isdir(originals_target_dir):
+        destination_filenames = [
+            filename
+            for filename in os.listdir(originals_target_dir)
+            if _is_image(originals_target_dir, filename)
+        ]
+    else:
+        destination_filenames = []
+    if len(source_filenames) == len(destination_filenames):
+        click.echo(' --> {} and {} have the same amount of images. skipping.'.format(
+            source_dir, originals_target_dir,
+        ))
+        if bar:
+            bar.update(len(source_filenames))
+        return
+    original_filenames_in_destination = set([
+        _extract_original_filename(filename)
+        for filename in destination_filenames
+    ])
+    for counter, filename in enumerate(source_filenames):
+        source_file = os.path.join(day_dir, filename)
+        # FIXME: hardcoded hack because I know the file structure
+        original_filename = _extract_original_filename(filename)
+        if original_filename in original_filenames_in_destination:
+            click.echo(' --> {} exists in destination. skipping.'.format(
+                original_filename
+            ))
+            if bar:
+                bar.update(counter)
             continue
-        for filename in os.listdir(day_dir):
-            source_file = os.path.join(day_dir, filename)
-            if not os.path.isfile(source_file):
-                continue
-            if filename.startswith('.'):
-                continue
-            if not filename.lower().endswith('.jpg'):
-                continue
-            # FIXME: hardcoded hack because I know the file structure
-            original_filename = filename[20:]
-            process_image(
-                source_file=source_file,
-                source_filename=original_filename,
-                target_dir=target_dir,
-                copy=copy,
-                resize=resize,
-                dryrun=dryrun,
-            )
+        process_image(
+            source_file=source_file,
+            source_filename=original_filename,
+            target_dir=target_dir,
+            copy=copy,
+            resize=resize,
+            dryrun=dryrun,
+        )
+        if bar:
+            bar.update(counter)
+
+
+def reprocess_all_images(**kwargs):
+    day_subdirs = [d for d in os.listdir(kwargs['source_dir']) if os.path.isdir(os.path.join(kwargs['source_dir'], d))]
+    for counter, day_subdir in enumerate(day_subdirs):
+        # reprocess_daydir(day_subdir=day_subdir, **kwargs)
+        _reprocess_daydir_with_progress(day_subdir=day_subdir, **kwargs)
+
+
+def reprocess_all_images_with_progress(**kwargs):
+    day_subdirs = os.listdir(kwargs['source_dir'])
+    with click.progressbar(length=len(day_subdirs), label='total progress') as bar:
+        for counter, day_subdir in enumerate(day_subdirs):
+            # reprocess_daydir(day_subdir=day_subdir, **kwargs)
+            _reprocess_daydir_with_progress(day_subdir=day_subdir, **kwargs)
+            bar.update(counter)
 
 
 def download_loop(**kwargs):
@@ -548,7 +630,7 @@ def cli():
 @click.option('--hard-exit/--no-hard-exit', default=False)
 @click.option('--mount-check-fail-sleep-duration', default=30, help='in seconds')
 @click.option('--delete-after-download/--no-delete-after-download', default=False, help='delete images from camera after successful download')
-@click.option('--image-download-sleep-duration', default=3, help='in seconds')
+@click.option('--image-download-sleep-duration', default=1, help='in seconds')
 @click.option('--loop/--no-loop', default=False, help='loop forever')
 def cli_download(loop, mount_check_file, **kwargs):
     if mount_check_file is None:
@@ -601,8 +683,7 @@ def cli_process(loop, mount_check_file, **kwargs):
 @click.option('--dryrun/--no-dryrun', default=False, help='do not actually do anything')
 def cli_reprocess(**kwargs):
     reprocess_all_images(**kwargs)
-
-
+    # reprocess_all_images_with_progress(**kwargs)
 
 
 @cli.command(name='upload', help='upload images')
@@ -646,3 +727,14 @@ disable_stdout_buffering()
 if __name__ == '__main__':
     print('PYTHONUNBUFFERED={}'.format(os.environ.get('PYTHONUNBUFFERED')))
     cli()
+
+
+def fix_json(source_path='/data/download-progress/', destination_path='/data/download-progress/'):
+    for filename in os.listdir(source_path):
+        filepath = os.path.join(source_path, filename)
+        if not (os.path.isfile(filepath) and filename.endswith('.json')):
+            continue
+        new_filepath = os.path.join(destination_path, filename[0:3], filename[3:6], filename)
+        mkdirs(os.path.dirname(new_filepath))
+        print('--> moving {} to {}'.format(filepath, new_filepath))
+        shutil.move(filepath, new_filepath)
