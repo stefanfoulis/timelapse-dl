@@ -63,24 +63,6 @@ def md5(fname, dryrun=False):
     return hash_md5.hexdigest()
 
 
-def lookahead(iterable):
-    """
-    Pass through all values from the given iterable, augmented by the
-    information if there are more values to come after the current one
-    (True), or if it is the last value (False).
-    """
-    # Get an iterator and pull the first value.
-    it = iter(iterable)
-    last = next(it)
-    # Run the iterator to exhaustion (starting from the second value).
-    for val in it:
-        # Report the *previous* value (more to come).
-        yield last, True
-        last = val
-    # Report the last value.
-    yield last, False
-
-
 def find_directory_links(tag):
     return (
         tag.name == 'a' and
@@ -104,7 +86,7 @@ def list_images():
         requests.get(base_url).content,
         'html.parser',
     )
-    directories = index.find_all(find_directory_links)
+    directories = reversed(index.find_all(find_directory_links))
     for directory in directories:
 
         directory_url = "".join([base_url, directory.attrs['href']])
@@ -113,7 +95,7 @@ def list_images():
             requests.get(directory_url).content,
             'html.parser',
         ).find_all(find_image_links)
-        for image in images:
+        for image in reversed(images):
             image_url = "".join([directory_url, image.attrs['href']])
             yield image_url
 
@@ -125,6 +107,7 @@ def download_all_images(
         delete_after_download=False,
         check=None,
         image_download_sleep_duration=3.0,
+        limit=None,
         **kwargs
 ):
     log("==> DOWNLOADING images to {}".format(target_dir))
@@ -133,32 +116,44 @@ def download_all_images(
     if check_and_raise(check):
         mkdirs(target_dir)
         mkdirs(progress_dir)
-    for image_url, has_more in lookahead(list_images()):
+    is_first = True
+    count = 1
+    for image_url in list_images():
         image_filename = image_url.split('/')[-1]
         progress_filename = '{}.json'.format(image_filename)
         progress_filepath = os.path.join(progress_dir, image_filename[0:3], image_filename[3:6], progress_filename)
         if skip_existing and os.path.exists(progress_filepath):
             log('   skipping download of {}'.format(image_url))
             if delete_after_download:
-                if has_more:
-                    delete_image(image_url)
+                if is_first:
+                    log('not deleting previously downloaded {} because it is the newest image'.format(image_url))
                 else:
-                    log('not deleting previously downloaded {} because it is the last one standing'.format(image_url))
+                    delete_image(image_url)
+            is_first = False
             continue
-        log('--> downloading {}'.format(image_url))
-        real_delete_after_download = delete_after_download and has_more
+        log('--> downloading [{} of {}] {}'.format(
+            count,
+            limit or 'inf',
+            image_url,
+        ))
+        real_delete_after_download = delete_after_download and not is_first
         raw_image_path = download(
             image_url,
             target_dir=target_dir,
             delete_after_download=real_delete_after_download,
             check=check,
         )
+        count += 1
         if raw_image_path and os.path.exists(raw_image_path):
             mkdirs(os.path.dirname(progress_filepath))
             with open(progress_filepath, 'w+') as f:
                 json.dumps({}, f)
         if delete_after_download and not real_delete_after_download:
-            log('did not delete {} because it is the last one standing'.format(image_url))
+            log('did not delete {} because it is the newest image'.format(image_url))
+        is_first = False
+        # if we've reached the download limit, stop.
+        if limit and count > limit:
+            return
         # desparate attempt to not have the gopro crash
         log('    sleeping for {}s, so gopro does not crash'.format(image_download_sleep_duration))
         time.sleep(image_download_sleep_duration)
@@ -632,6 +627,7 @@ def cli():
 @click.option('--delete-after-download/--no-delete-after-download', default=False, help='delete images from camera after successful download')
 @click.option('--image-download-sleep-duration', default=1, help='in seconds')
 @click.option('--loop/--no-loop', default=False, help='loop forever')
+@click.option('--limit', default=25, help='limit the download to the newest x images. In loop mode, download the x newest images and repeat')
 def cli_download(loop, mount_check_file, **kwargs):
     if mount_check_file is None:
         check = lambda: True
