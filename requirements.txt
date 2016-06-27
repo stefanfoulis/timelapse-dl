@@ -8,3 +8,6 @@ colorama
 awscli
 honcho
 contexttimer
+boto3
+furl
+ipdb
