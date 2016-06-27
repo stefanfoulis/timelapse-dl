@@ -6,6 +6,9 @@ import tempfile
 import click
 import collections
 
+import boto3
+from boto3.s3.transfer import S3Transfer
+from furl import furl
 import gc
 import requests
 import os
@@ -88,7 +91,6 @@ def list_images():
     )
     directories = reversed(index.find_all(find_directory_links))
     for directory in directories:
-
         directory_url = "".join([base_url, directory.attrs['href']])
         log("--> listing images from: {}".format(directory_url))
         images = BeautifulSoup(
@@ -384,7 +386,7 @@ def process_image(
 
 
 def process_all_images(source_dir, **kwargs):
-    for filename in os.listdir(source_dir):
+    for filename in reversed(os.listdir(source_dir)):
         filepath = os.path.join(source_dir, filename)
         if not os.path.isfile(filepath):
             continue
@@ -588,6 +590,104 @@ def upload(copy, sync, source_dir, destination, aws_profile, aws_region, dryrun=
             raise Exception('[!!!!!] "{}" failed! '.format(cmd))
 
 
+def build_fake_image_url(key):
+    return 'https://{}/{}'.format(
+        'a-random-host.com',
+        key,
+    )
+
+
+def report_image_urls(urls, api_url):
+    api = furl(api_url)
+    token = api.password
+    api.password = None
+    response = requests.post(
+        str(api),
+        headers={
+            'Authorization': 'Token {}'.format(token),
+            'Content-Type': 'application/json'
+        },
+        data=json.dumps({
+            'images': [
+                {'image_url': url}
+                for url in urls
+            ]
+        })
+    )
+
+
+def upload_file(s3_transfer, source_path, destination, report_api=None, delete_after_upload=True, dryrun=True, **kwargs):
+    url = furl(destination)
+    bucket = url.host
+    key = str(url.path).lstrip('/')
+    log(' ---> upload {} to {}:{} {}'.format(source_path, bucket, key, '[dryrun]' if dryrun else ''))
+    if dryrun:
+        return
+    s3_transfer.upload_file(
+        source_path,
+        bucket,
+        key,
+        extra_args=dict(
+            ACL='public-read',
+            CacheControl='max-age=604800',
+            ContentType='image/jpeg',
+        )
+    )
+    if delete_after_upload:
+        log(' ---> deleting {}'.format(source_path))
+        os.remove(source_path)
+    if report_api:
+        report_image_urls(
+            urls=[build_fake_image_url(key)],
+            api_url=report_api,
+        )
+
+
+def upload2(source_dir, destination, aws_profile, aws_region, limit=None, dryrun=False, **kwargs):
+    session = boto3.Session(
+        profile_name=aws_profile or 'default',
+        region_name=aws_region,
+    )
+    s3_transfer = S3Transfer(session.client('s3'))
+    upload_count = 0
+    for size in sorted(os.listdir(source_dir), reverse=True):
+        size_dir = os.path.join(source_dir, size)
+        if size.startswith('.') or not os.path.isdir(size_dir):
+            continue
+        log(' -> {}'.format(size_dir))
+        for date in sorted(os.listdir(size_dir), reverse=True):
+            date_dir = os.path.join(size_dir, date)
+            if date.startswith('.') or not os.path.isdir(date_dir):
+                continue
+            images = list(sorted(os.listdir(date_dir), reverse=True))
+            log('    -> {} ({})'.format(date, len(images)))
+            for image in images:
+                image_path = os.path.join(date_dir, image)
+                if (
+                    size.startswith('.') or
+                    not os.path.isfile(image_path) or
+                    not image.upper().endswith('.JPG')
+                ):
+                    continue
+                file_destination = furl(destination)
+                file_destination.path.add(size).add(date).add(image)
+                log('     --> upload [{} of {}] {}'.format(
+                    upload_count+1,
+                    limit or 'inf',
+                    file_destination,
+                ))
+                upload_file(
+                    s3_transfer=s3_transfer,
+                    source_path=image_path,
+                    destination=str(file_destination),
+                    dryrun=dryrun,
+                    **kwargs
+                )
+                upload_count += 1
+                if limit and upload_count >= limit:
+                    return
+
+
 def upload_loop(**kwargs):
     mount_check_fail_sleep_duration = kwargs['mount_check_fail_sleep_duration']
     check = kwargs['check']
@@ -604,7 +704,7 @@ def upload_loop(**kwargs):
                 exit(1)
             continue
         try:
-            upload(**kwargs)
+            upload2(**kwargs)
         except Exception as e:
             log(e)
         log("--> sleeping for {}s <--".format(upload_sleep_duration))
@@ -649,7 +749,7 @@ def cli_download(loop, mount_check_file, **kwargs):
 @click.option('--mount-check-file', default=None)
 @click.option('--hard-exit/--no-hard-exit', default=False)
 @click.option('--mount-check-fail-sleep-duration', default=30, help='in seconds')
-@click.option('--image-process-sleep-duration', default=10, help='in seconds')
+@click.option('--image-process-sleep-duration', default=5, help='in seconds')
 @click.option('--loop/--no-loop', default=False, help='loop forever')
 @click.option('--copy/--move', default=False, help='copy or move the file. default: move')
 def cli_process(loop, mount_check_file, **kwargs):
@@ -690,11 +790,13 @@ def cli_reprocess(**kwargs):
 @click.option('--mount-check-file', default=None)
 @click.option('--hard-exit/--no-hard-exit', default=False)
 @click.option('--mount-check-fail-sleep-duration', default=30, help='in seconds')
-@click.option('--upload-sleep-duration', default=60, help='in seconds')
+@click.option('--upload-sleep-duration', default=10, help='in seconds')
 @click.option('--loop/--no-loop', default=False, help='loop forever')
 @click.option('--copy/--move', default=True, help='copy or move the file. default: copy')
 @click.option('--sync/--no-sync', default=True, help='sync rather than blind copy. does not work with --move. default: --sync')
 @click.option('--dryrun/--no-dryrun', default=False, help='do not actually do anything')
+@click.option('--limit', default=25, help='limit the upload to the newest x images. In loop mode, upload the x newest images and repeat')
+@click.option('--report-api', default='', help='api endpoint to report uploaded files to')
 def cli_upload(loop, mount_check_file, **kwargs):
     if mount_check_file is None:
         check = lambda: True
@@ -705,7 +807,7 @@ def cli_upload(loop, mount_check_file, **kwargs):
         click.echo('Starting upload in loop mode')
         upload_loop(**kwargs)
     else:
-        upload(**kwargs)
+        upload2(**kwargs)
 
 
 def disable_stdout_buffering():
